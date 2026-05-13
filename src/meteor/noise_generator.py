@@ -1298,11 +1298,6 @@ class MeteorNoiseGenerator:
         # Load variable_name if available (for backward compatibility)
         self.variable_name = model_data.get("variable_name", None)
 
-        # Backward compatibility: older cached Student-t models may not
-        # include resolved per-PC df values.
-        if self.noise_pc_distribution == "t" and self._fitted_df is None:
-            self._resolve_df(verbose=False)
-
         print(f"Model loaded from {filepath}")
 
 
