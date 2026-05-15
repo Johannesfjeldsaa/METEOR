@@ -822,71 +822,127 @@ class PCAVARXNoiseModel(NoiseModelBase):
 
         return synthetic_pcs
 
-    # ------------------------------------------------------------------
-    # Spatial helpers
-    # ------------------------------------------------------------------
-
+    # TODO check if we can use the weights calculator from geo_data_utils.py
     def _compute_spatial_weights(self) -> np.ndarray:
-        """Compute area-weighted spatial averaging weights (cos latitude)."""
+        """Compute area-weighted spatial averaging weights (cosine of latitude)."""
         return np.cos(np.deg2rad(self.coords["lat"]))
 
     def _find_nearest_gridpoint(
         self, target_lat: float, target_lon: float
     ):
-        """Return ``(lat_idx, lon_idx)`` of the nearest gridpoint."""
+        """
+        Find the nearest gridpoint to the target latitude and longitude.
+
+        Parameters
+        ----------
+        target_lat : float
+            Target latitude in degrees
+        target_lon : float
+            Target longitude in degrees (0-360 or -180 to 180)
+
+        Returns
+        -------
+        tuple
+            (lat_idx, lon_idx) indices of the nearest gridpoint
+        """
         lats = self.coords["lat"]
         lons = self.coords["lon"]
 
+        # Normalize longitude to 0-360 range
         target_lon = target_lon % 360
         lons_normalized = lons % 360
 
+        # Find nearest latitude
+        # print(lats)
+        # print(target_lat)
         lat_idx = np.argmin(np.abs(lats - target_lat))
+
+        # Find nearest longitude
         lon_idx = np.argmin(np.abs(lons_normalized - target_lon))
+
         return lat_idx, lon_idx
 
     def _get_point_eof_values(self, lat: float, lon: float) -> np.ndarray:
         """
-        Return EOF values at a specific gridpoint, shape ``(n_modes,)``.
+        Get EOF values at a specific point (no averaging).
 
-        Results are cached in-memory.
+        Cached in memory since EOFs are model-invariant.
+
+        Parameters
+        ----------
+        lat : float
+            Latitude in degrees
+        lon : float
+            Longitude in degrees
+
+        Returns
+        -------
+        np.ndarray
+            EOF values at the point, shape (n_modes,)
         """
+        # Create cache key
         point_id = f"point_{lat:.2f}_{lon:.2f}"
         if point_id in self._regional_eof_projections:
             return self._regional_eof_projections[point_id]
 
+        # Find nearest gridpoint
         lat_idx, lon_idx = self._find_nearest_gridpoint(lat, lon)
+
+        # Get EOFs reshaped to spatial grid
         n_lat = len(self.coords["lat"])
         n_lon = len(self.coords["lon"])
         eof_components = self.pca.components_.reshape(self.n_modes, n_lat, n_lon)
+
+        # Extract values at the point (no averaging needed)
         eof_point_values = eof_components[:, lat_idx, lon_idx]
 
+        # Cache and return
         self._regional_eof_projections[point_id] = eof_point_values
         return eof_point_values
+
+    # TODO region masking and averaging from geo_data_utils.py could be reused here?
 
     def _get_regional_eof_projection(
         self, region: str, region_mask=None
     ) -> np.ndarray:
         """
-        Return the spatial-mean EOF projection for a region, shape ``(n_modes,)``.
+        Get or compute the spatial mean projection of each EOF for a region.
 
-        Results are cached in-memory.
+        Cached in memory since EOFs are model-invariant.
+
+        Parameters
+        ----------
+        region : str
+            Region identifier ('global' or AR6 region code like 'NEU')
+        region_mask : np.ndarray, optional
+            Custom 2D boolean mask (n_lat, n_lon) for the region
+
+        Returns
+        -------
+        np.ndarray
+            Mean projection of each EOF mode for the region, shape (n_modes,)
         """
+        # Check cache first
         region_id = (
             region if region_mask is None else f"custom_{id(region_mask)}"
         )
         if region_id in self._regional_eof_projections:
             return self._regional_eof_projections[region_id]
 
+        # Compute EOF projections
         n_lat = len(self.coords["lat"])
         n_lon = len(self.coords["lon"])
-        eof_components = self.pca.components_.reshape(self.n_modes, n_lat, n_lon)
 
+        # Get EOFs reshaped to spatial grid (n_modes, n_lat, n_lon)
+        eof_components = self.pca.components_.reshape(self.n_modes, n_lat, n_lon)
         if region_mask is None and region != "global":
             region_mask = self._get_ar6_region_mask(region)
 
         eof_projections = self._weighted_mean_over_region(
             eof_components, None, None, region_mask, region
         )
+
+        # Cache and return
         self._regional_eof_projections[region_id] = eof_projections
         return eof_projections
 
@@ -1010,13 +1066,13 @@ class PCAVARXNoiseModel(NoiseModelBase):
 
         # Compute seasonal cycle regional mean
         X = SeasonalModel.create_harmonic_features(time, global_temp_trajectory)
+
         if noise_only:
             # For noise-only: seasonal harmonics without direct temperature effect
             seasonal_cycle = self.seasonal_model.predict(time, global_temp_trajectory)
             intercept_effect = self.seasonal_model.intercept_
             temp_effect = (
-                self.seasonal_model.coef_[:, 0]
-                * global_temp_trajectory[:, np.newaxis]
+                self.seasonal_model.coef_[:, 0] * global_temp_trajectory[:, np.newaxis]
             )
             seasonal_cycle_full = (
                 seasonal_cycle - intercept_effect[np.newaxis, :] - temp_effect
@@ -1038,7 +1094,6 @@ class PCAVARXNoiseModel(NoiseModelBase):
         seasonal_mean = self._weighted_mean_over_region(
             seasonal_cycle_grid, lat, lon, region_mask, region
         )
-
         # Compute base climatology (if provided)
         base_mean = None
         if add_base is not None:
@@ -1111,7 +1166,10 @@ class PCAVARXNoiseModel(NoiseModelBase):
         # Multiple realizations - concatenate with 'realization' dimension
         return xr.DataArray(
             np.array(realizations),
-            coords={"realization": np.arange(len(realizations)), "month": time},
+            coords={
+                "realization": np.arange(len(realizations)),
+                "month": time,
+            },
             dims=("realization", "month"),
             attrs=attrs,
         )
@@ -1123,20 +1181,42 @@ class PCAVARXNoiseModel(NoiseModelBase):
     def _weighted_mean_over_region(
         self, data: np.ndarray, lat, lon, region_mask, region: str
     ) -> np.ndarray:
-        """Compute cos-latitude weighted mean over a region or point."""
+        """
+        Compute weighted mean over a region or point extraction.
+
+        Parameters
+        ----------
+        data : np.ndarray
+            Input data with shape (n_time, n_lat, n_lon)
+        lat : float, optional
+            Latitude for point extraction (degrees)
+        lon : float, optional
+            Longitude for point extraction (degrees)
+        region_mask : np.ndarray, optional
+            Custom 2D boolean mask (n_lat, n_lon) for region
+        Returns
+        -------
+        np.ndarray
+            Weighted mean time series with shape (n_time,)
+        """
+        # Point extraction
         if lat is not None and lon is not None:
             lat_idx, lon_idx = self._find_nearest_gridpoint(lat, lon)
             return data[:, lat_idx, lon_idx]
 
+        # Regional or global mean, start by computing area weights
         weights = self._compute_spatial_weights()
         weight_grid = weights[:, np.newaxis]
-
         if region == "global" and region_mask is None:
+            # Global mean
             total_weight = np.sum(weights) * data.shape[2]
             return np.array(
-                [np.sum(data[t] * weight_grid) / total_weight for t in range(data.shape[0])]
+                [
+                    np.sum(data[t] * weight_grid) / total_weight
+                    for t in range(data.shape[0])
+                ]
             )
-
+        # Regional mean
         mean_values = np.zeros(data.shape[0])
         for t in range(data.shape[0]):
             masked_data = np.where(region_mask, data[t], np.nan)
@@ -1147,9 +1227,22 @@ class PCAVARXNoiseModel(NoiseModelBase):
         return mean_values
 
     def _get_ar6_region_mask(self, region: str) -> np.ndarray:
-        """Return a 2-D boolean mask ``(n_lat, n_lon)`` for an AR6 region."""
+        """
+        Get AR6 region mask for the model grid.
+
+        Parameters
+        ----------
+        region : str
+            AR6 region code (e.g., 'NEU', 'WNA')
+
+        Returns
+        -------
+        np.ndarray
+            2D boolean mask (n_lat, n_lon) for the region
+        """
         ar6_regions = regionmask.defined_regions.ar6.all
 
+        # Find region number
         region_number = None
         for r in ar6_regions:
             if r.abbrev == region:
@@ -1159,11 +1252,15 @@ class PCAVARXNoiseModel(NoiseModelBase):
         if region_number is None:
             raise ValueError(f"AR6 region '{region}' not found")
 
+        # Create mask on this grid
         lons = self.coords["lon"]
+
         lats = self.coords["lat"]
+
         lon_2d, lat_2d = np.meshgrid(lons, lats)
         mask_3d = ar6_regions.mask(lon_2d, lat_2d)
-        return mask_3d == region_number
+        region_mask = mask_3d == region_number
+        return region_mask
 
     # ------------------------------------------------------------------
     # Serialization
