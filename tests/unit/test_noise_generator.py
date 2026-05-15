@@ -518,3 +518,294 @@ def test_generate_realization_unfitted_error():
 
     with pytest.raises(ValueError, match="Model must be fitted before generating"):
         generator.generate_realization(test_trajectory)
+
+
+# ============================================================================
+# Student-t error distribution tests
+# ============================================================================
+
+
+def _make_simple_fitted_generator(noise_pc_distribution="normal", t_df=None, n_modes=2):
+    """Helper to create a fitted MeteorNoiseGenerator with synthetic data."""
+    time = np.arange(120)
+    lats = np.linspace(-90, 90, 5)
+    lons = np.linspace(-180, 180, 6)
+    ens = np.array([1])
+
+    temp_data = np.zeros((len(time), len(lats), len(lons), len(ens)))
+    for i, t in enumerate(time):
+        seasonal = 10 * np.sin(2 * np.pi * t / 12.0)
+        trend = 0.01 * t
+        for j, lat in enumerate(lats):
+            for k, lon in enumerate(lons):
+                temp_data[i, j, k, 0] = seasonal + trend + 0.1 * lat + 0.05 * lon
+
+    temp_da = xr.DataArray(
+        temp_data,
+        coords={"month": time, "lat": lats, "lon": lons, "ens": ens},
+        dims=["month", "lat", "lon", "ens"],
+    )
+    data = xr.Dataset({"tas": temp_da})
+
+    generator = MeteorNoiseGenerator(
+        n_modes=n_modes,
+        lag_order=1,
+        noise_pc_distribution=noise_pc_distribution,
+        t_df=t_df,
+    )
+    generator.fit(data, "tas")
+    return generator
+
+
+class TestStudentTInitialization:
+    """Tests for Student-t parameter initialization and validation."""
+
+    def test_default_normal_distribution(self):
+        gen = MeteorNoiseGenerator()
+        assert gen.noise_pc_distribution == "normal"
+        assert gen.t_df is None
+        assert gen._fitted_df is None
+
+    def test_t_distribution_with_float_df(self):
+        gen = MeteorNoiseGenerator(noise_pc_distribution="t", t_df=6.0)
+        assert gen.noise_pc_distribution == "t"
+        assert gen.t_df == 6.0
+
+    def test_t_distribution_with_none_df(self):
+        gen = MeteorNoiseGenerator(noise_pc_distribution="t", t_df=None)
+        assert gen.noise_pc_distribution == "t"
+        assert gen.t_df is None
+
+    def test_invalid_distribution_raises(self):
+        with pytest.raises(ValueError, match="noise_pc_distribution must be"):
+            MeteorNoiseGenerator(noise_pc_distribution="gamma")
+
+    def test_df_too_low_raises(self):
+        with pytest.raises(ValueError, match="t_df must be > 2"):
+            MeteorNoiseGenerator(noise_pc_distribution="t", t_df=2.0)
+
+        with pytest.raises(ValueError, match="t_df must be > 2"):
+            MeteorNoiseGenerator(noise_pc_distribution="t", t_df=1.5)
+
+    def test_df_low_warns(self):
+        with pytest.warns(match="t_df=3.0 <= 4 implies infinite kurtosis"):
+            MeteorNoiseGenerator(noise_pc_distribution="t", t_df=3.0)
+
+    def test_df_list_accepted(self):
+        gen = MeteorNoiseGenerator(noise_pc_distribution="t", t_df=[4, 6, 8, 10])
+        assert gen.t_df == [4, 6, 8, 10]
+
+    def test_df_mle_string_accepted(self):
+        gen = MeteorNoiseGenerator(noise_pc_distribution="t", t_df="mle")
+        assert gen.t_df == "mle"
+
+    def test_df_invalid_string_rejected(self):
+        with pytest.raises(ValueError, match="t_df string must be 'mle'"):
+            MeteorNoiseGenerator(noise_pc_distribution="t", t_df="invalid")
+
+
+class TestStudentTFitting:
+    """Tests for Student-t df resolution during fit()."""
+
+    def test_fit_resolves_none_to_default(self):
+        gen = _make_simple_fitted_generator(noise_pc_distribution="t", t_df=None)
+        assert isinstance(gen._fitted_df, np.ndarray)
+        assert gen._fitted_df.shape == (gen.n_modes,)
+        np.testing.assert_allclose(gen._fitted_df, 10.0)
+
+    def test_fit_resolves_float_directly(self):
+        gen = _make_simple_fitted_generator(noise_pc_distribution="t", t_df=6.0)
+        assert isinstance(gen._fitted_df, np.ndarray)
+        assert gen._fitted_df.shape == (gen.n_modes,)
+        np.testing.assert_allclose(gen._fitted_df, 6.0)
+
+    def test_fit_mle_selects_from_list(self):
+        gen = _make_simple_fitted_generator(
+            noise_pc_distribution="t", t_df="mle"
+        )
+        assert isinstance(gen._fitted_df, np.ndarray)
+        assert gen._fitted_df.shape == (gen.n_modes,)
+        # Each PC gets its own df via univariate MLE (must be > 2)
+        assert np.all(gen._fitted_df > 2.0)
+
+    def test_fit_normal_does_not_set_fitted_df(self):
+        gen = _make_simple_fitted_generator(noise_pc_distribution="normal")
+        assert gen._fitted_df is None
+
+
+class TestStudentTGeneration:
+    """Tests for Student-t shock generation."""
+
+    def test_generation_produces_valid_output(self):
+        gen = _make_simple_fitted_generator(noise_pc_distribution="t", t_df=6.0)
+        trajectory = np.linspace(0, 2, 60)
+        pcs = gen.generate_stochastic_pcs(trajectory, n_realizations=1)
+        assert pcs.shape == (60, 2)
+        assert not np.any(np.isnan(pcs))
+
+    def test_generation_multiple_realizations(self):
+        gen = _make_simple_fitted_generator(noise_pc_distribution="t", t_df=6.0)
+        trajectory = np.linspace(0, 2, 60)
+        pcs = gen.generate_stochastic_pcs(trajectory, n_realizations=5)
+        assert pcs.shape == (5, 60, 2)
+        assert not np.any(np.isnan(pcs))
+
+    def test_full_realization_valid(self):
+        gen = _make_simple_fitted_generator(noise_pc_distribution="t", t_df=6.0)
+        trajectory = np.linspace(0, 2, 24)
+        real = gen.generate_realization(trajectory, n_realizations=1)
+        assert isinstance(real, xr.DataArray)
+        assert real.dims == ("month", "lat", "lon")
+        assert not np.any(np.isnan(real.values))
+
+    def test_heavier_tails_than_normal(self):
+        """Student-t with low df should produce higher kurtosis than normal."""
+        np.random.seed(42)
+        gen_normal = _make_simple_fitted_generator(noise_pc_distribution="normal")
+        gen_t = _make_simple_fitted_generator(noise_pc_distribution="t", t_df=5.0)
+
+        trajectory = np.linspace(0, 2, 240)  # 20 years
+        n_real = 200
+
+        # Generate many realizations and collect the first PC values
+        normal_pcs = gen_normal.generate_stochastic_pcs(
+            trajectory, n_realizations=n_real, random_seed=42
+        )
+        t_pcs = gen_t.generate_stochastic_pcs(
+            trajectory, n_realizations=n_real, random_seed=42
+        )
+
+        # Flatten first PC across realizations and time
+        normal_vals = normal_pcs[:, :, 0].ravel()
+        t_vals = t_pcs[:, :, 0].ravel()
+
+        # Student-t should have higher kurtosis (heavier tails)
+        from scipy.stats import kurtosis
+
+        kurt_normal = kurtosis(normal_vals)
+        kurt_t = kurtosis(t_vals)
+        assert kurt_t > kurt_normal, (
+            f"Student-t kurtosis ({kurt_t:.2f}) should exceed "
+            f"normal kurtosis ({kurt_normal:.2f})"
+        )
+
+
+class TestStudentTSaveLoad:
+    """Tests for save/load round-trip of Student-t models."""
+
+    def test_save_load_roundtrip_normal(self):
+        gen = _make_simple_fitted_generator(noise_pc_distribution="normal")
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "model.pkl")
+            gen.save_model(path)
+
+            loaded = MeteorNoiseGenerator()
+            loaded.load_model(path)
+            assert loaded.noise_pc_distribution == "normal"
+            assert loaded.t_df is None
+            assert loaded._fitted_df is None
+
+    def test_save_load_roundtrip_student_t(self):
+        gen = _make_simple_fitted_generator(noise_pc_distribution="t", t_df=6.0)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "model.pkl")
+            gen.save_model(path)
+
+            loaded = MeteorNoiseGenerator()
+            loaded.load_model(path)
+            assert loaded.noise_pc_distribution == "t"
+            assert loaded.t_df == 6.0
+            assert isinstance(loaded._fitted_df, np.ndarray)
+            np.testing.assert_allclose(loaded._fitted_df, 6.0)
+
+    def test_backward_compat_load_old_model(self):
+        """Loading a model saved without noise_pc_distribution fields should default to normal."""
+        gen = _make_simple_fitted_generator(noise_pc_distribution="normal")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "model.pkl")
+            gen.save_model(path)
+
+            # Simulate old model by stripping new keys
+            import pickle
+
+            with open(path, "rb") as f:
+                data = pickle.load(f)  # nosec
+            data.pop("noise_pc_distribution", None)
+            data.pop("t_df", None)
+            data.pop("_fitted_df", None)
+            with open(path, "wb") as f:
+                pickle.dump(data, f)
+
+            loaded = MeteorNoiseGenerator()
+            loaded.load_model(path)
+            assert loaded.noise_pc_distribution == "normal"
+            assert loaded.t_df is None
+            assert loaded._fitted_df is None
+
+
+class TestStudentTCacheValidation:
+    """Tests for cache validation with noise_pc_distribution."""
+
+    def test_cache_valid_normal(self):
+        from meteor.noise_generator import validate_noise_model_cache
+
+        gen = _make_simple_fitted_generator(noise_pc_distribution="normal")
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "model.pkl")
+            gen.save_model(path)
+
+            is_valid, model, info = validate_noise_model_cache(
+                path, "tas", n_modes=2, lag_order=1, noise_pc_distribution="normal"
+            )
+            assert is_valid
+
+    def test_cache_invalid_distribution_mismatch(self):
+        from meteor.noise_generator import validate_noise_model_cache
+
+        gen = _make_simple_fitted_generator(noise_pc_distribution="normal")
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "model.pkl")
+            gen.save_model(path)
+
+            is_valid, model, info = validate_noise_model_cache(
+                path, "tas", n_modes=2, lag_order=1, noise_pc_distribution="t"
+            )
+            assert not is_valid
+            assert "noise_pc_distribution mismatch" in info["message"]
+
+    def test_cache_valid_student_t(self):
+        from meteor.noise_generator import validate_noise_model_cache
+
+        gen = _make_simple_fitted_generator(noise_pc_distribution="t", t_df="mle")
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "model.pkl")
+            gen.save_model(path)
+
+            is_valid, model, info = validate_noise_model_cache(
+                path, "tas", n_modes=2, lag_order=1,
+                noise_pc_distribution="t", t_df="mle",
+            )
+            assert is_valid
+
+
+class TestCacheNameEncoding:
+    """Tests for distribution-aware cache filenames."""
+
+    def test_normal_cache_name(self):
+        from meteor.noise_generator import _noise_model_cache_name
+
+        name = _noise_model_cache_name("CanESM5", "tas", "normal")
+        assert name == "CanESM5_tas_noise_model.pkl"
+
+    def test_t_cache_name(self):
+        from meteor.noise_generator import _noise_model_cache_name
+
+        name = _noise_model_cache_name("CanESM5", "tas", "t")
+        assert name == "CanESM5_tas_noise_model_t.pkl"
+
+    def test_default_is_normal(self):
+        from meteor.noise_generator import _noise_model_cache_name
+
+        name = _noise_model_cache_name("CanESM5", "tas")
+        assert name == "CanESM5_tas_noise_model.pkl"

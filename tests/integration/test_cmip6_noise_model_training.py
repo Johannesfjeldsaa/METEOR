@@ -224,3 +224,57 @@ def test_noise_model_validation(test_data_dir):
         assert validation_results[2]["message"].startswith(
             "n_modes mismatch: expected 6"
         )
+
+
+def test_noise_model_student_t_training(test_data_dir):
+    """Test noise model training with Student-t error distribution."""
+    cache_path = os.path.join(test_data_dir, "light_mock_cache")
+    data_getter = cmip6_meteor_data_getter.Cmip6MeteorDataGetter(
+        exps=["historical", "ssp245"],
+        dbe=["CMIP", "ScenarioMIP"],
+        cache_dir=cache_path,
+        enable_cache=True,
+    )
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # Train with Student-t distribution
+        noise_model = train_noise_model_from_cmip6(
+            data_getter,
+            experiments=["historical", "ssp245"],
+            model_name="CanESM5",
+            variable_name="tas",
+            n_modes=5,
+            lag_order=1,
+            cache_dir=tmpdir,
+            noise_pc_distribution="t",
+            t_df=8.0,
+        )
+
+        assert noise_model.fitted is True
+        assert noise_model.noise_pc_distribution == "t"
+        assert noise_model._fitted_df == 8.0
+
+        # Verify cache file has _t suffix
+        cache_files = os.listdir(tmpdir)
+        t_files = [f for f in cache_files if "_t.pkl" in f]
+        assert len(t_files) == 1, f"Expected one *_t.pkl file, got: {cache_files}"
+
+        # Validate cache recognizes distribution
+        cache_file = os.path.join(tmpdir, t_files[0])
+        is_valid, _, info = validate_noise_model_cache(
+            cache_file, "tas", n_modes=5, lag_order=1, noise_pc_distribution="t"
+        )
+        assert is_valid
+
+        # Should be invalid if we ask for normal distribution
+        is_valid, _, info = validate_noise_model_cache(
+            cache_file, "tas", n_modes=5, lag_order=1, noise_pc_distribution="normal"
+        )
+        assert not is_valid
+        assert "noise_pc_distribution mismatch" in info["message"]
+
+        # Generate a realization to verify end-to-end
+        trajectory = np.linspace(0, 2, 60)
+        real = noise_model.generate_realization(trajectory, n_realizations=1)
+        assert real.dims == ("month", "lat", "lon")
+        assert not np.any(np.isnan(real.values))
