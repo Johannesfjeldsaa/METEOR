@@ -1,72 +1,112 @@
 """
-Module for generating climate noise realizations using PCA and VARX modeling.
+METEOR noise generator — plumbing module.
 
-This module implements the methodology for:
-1. Temperature-dependent seasonal cycle extraction using modulated harmonic regression
-        xr.DataArray or list of xr.DataArray
-            Generated climate realizations. If noise_only=True, returns the
-            stochastic component plus temperature-modulated harmonics (but without
-            direct temperature trends) that can be added to other predictions.PCA-based spatial decomposition of anomalies
-3. VARX modeling of principal components
-4. Stochastic simulation of new climate realizations
-5. Noise-only generation for combining with annual climate projections
+This module is the primary entry point for training and caching METEOR noise
+models. Concrete implementations live in the ``meteor.noise_model`` subpackage.
+This module provides the following high-level helpers:
+
+- ``MeteorNoiseGenerator`` — backward-compatible alias for
+  ``meteor.noise_model.PCAVARXNoiseModel``.
+- ``train_noise_model_from_cmip6()`` — fetch CMIP6 data, fit a noise model of
+  the requested type, and optionally cache it.
+- ``train_multiple_noise_models_from_cmip6()`` — batch variant of the above.
+- ``load_noise_model_from_cache()`` — load a previously cached model.
+- ``validate_noise_model_cache()`` — verify cache integrity.
+
+Adding a new noise model type
+-----------------------------
+
+1. Create a module under ``meteor/noise_model/`` and implement a subclass of
+   ``NoiseModelBase``.
+2. Decorate the class with ``@register_noise_model("my-key")`` from
+   ``meteor.noise_model.registry``.
+3. Import the new module in ``meteor/noise_model/__init__.py`` so the
+   decorator runs at import time.
+4. Call ``train_noise_model_from_cmip6(..., model_type="my-key")``.
+   If the new model needs additional CMIP6 data beyond the defaults, declare
+   it in ``cls.required_data()`` and extend the bundle assembly in
+   ``train_noise_model_from_cmip6()``.
 """
 
 import os
-import pickle  # nosec - Used for trusted model serialization only
+import inspect
 import warnings
 
 import numpy as np
-import regionmask
-import xarray as xr
-from sklearn.decomposition import PCA
-from sklearn.linear_model import LinearRegression
-from statsmodels.tsa.api import VAR
 
-from .geo_data_utils import global_mean
+from .noise_model import PCAVARXNoiseModel, TrainingBundle
+from .noise_model.registry import get_noise_model_class, normalize_key
+from .noise_model.pca_varx import PCA_VARX_ALIASES
 
+# ---------------------------------------------------------------------------
+# Backward-compatible module-level constants
+# ---------------------------------------------------------------------------
+
+#: Distributions supported by PCAVARXNoiseModel; kept here for code that
+#: does ``from meteor.noise_generator import implemented_noise_pc_distribution``.
 implemented_noise_pc_distribution = ["normal", "t"]
 
 
-def _apply_student_t_posthoc_scaling(synthetic_pcs, fitted_df):
-    """
-    Apply post-hoc Student-t scaling to Gaussian VAR output PCs.
+def _noise_model_cache_name(
+    model_name,
+    variable_name,
+    noise_pc_distribution="normal",
+    model_type="pca-varx",
+    ):
+    """Generate a cache filename that encodes model type and distribution.
+
+    Parameters
+    ----------
+    model_name : str
+        Name of the climate model, e.g. ``"CanESM5"``.
+    variable_name : str
+        Name of the variable, e.g. ``"tas"``.
+    noise_pc_distribution : {"normal", "t"}, default: "normal"
+        Distribution used for the noise principal components.
+    model_type : str, default: "pca-varx"
+        Noise model identifier. ``"pca-varx"`` triggers the legacy naming
+        scheme so existing caches remain valid.
+
+    Returns
+    -------
+    str
+        The generated cache filename.
+
+    Raises
+    ------
+    ValueError
+        If ``noise_pc_distribution`` is not ``"normal"`` or ``"t"``.
 
     Notes
     -----
-    The VAR loop is always simulated with Gaussian innovations. For Student-t
-    output, each PC and timestep is then scaled as:
+    The naming rules are:
 
-        y_t = sqrt(df / V_t) * y_t_normal,  V_t ~ chi2(df)
+    * For ``model_type="pca-varx"`` the legacy format is used::
 
-    This preserves VAR temporal structure while introducing heavier tails in
-    the output marginals.
+            CanESM5_tas_noise_model.pkl       # normal
+            CanESM5_tas_noise_model_t.pkl     # Student-t
+
+    * For all other model types the type string is embedded::
+
+            CanESM5_tas_<model_type>_noise_model.pkl
+            CanESM5_tas_<model_type>_noise_model_t.pkl
     """
-    df_arr = np.asarray(fitted_df)
-    chi2_samples = np.column_stack(
-        [np.random.chisquare(df_j, size=synthetic_pcs.shape[0]) for df_j in df_arr]
-    )
-    scale_factors = np.sqrt(df_arr[np.newaxis, :] / chi2_samples)
-    return synthetic_pcs * scale_factors
+    if model_type in PCA_VARX_ALIASES:
+        # Legacy format — keeps existing caches valid
+        base = f"{model_name}_{variable_name}_noise_model"
+    else:
+        model_type = normalize_key(model_type)
+        base = f"{model_name}_{variable_name}_{model_type}_noise_model"
 
-def _noise_model_cache_name(
-    model_name, variable_name, noise_pc_distribution="normal"
-):
-    """Generate cache filename encoding the error distribution.
-
-    Examples: 'CanESM5_tas_noise_model.pkl' (normal),
-              'CanESM5_tas_noise_model_t.pkl' (Student-t)
-    """
-    base = f"{model_name}_{variable_name}_noise_model"
     if noise_pc_distribution == "t":
         return f"{base}_t.pkl"
-    elif noise_pc_distribution == "normal":
+    if noise_pc_distribution == "normal":
         return f"{base}.pkl"
-    else:
-        raise ValueError(
-            f"Invalid noise_pc_distribution: {noise_pc_distribution}. "
-            f"Must be 'normal' or 't'."
-        )
+    raise ValueError(
+        f"Invalid noise_pc_distribution: '{noise_pc_distribution}'. "
+        "Must be 'normal' or 't'."
+    )
+
 
 
 class MeteorNoiseGenerator:
@@ -769,7 +809,7 @@ class MeteorNoiseGenerator:
             A_matrices.append(params[start_idx:end_idx, :].T)
 
         # Exogenous coefficient matrix B (n_modes × n_exog)
-        B_matrix = params[-n_exog:, :].T
+        B_matrix = params[-n_exog:, :].T if n_exog else None
 
         # Residual covariance matrix Σ (n_modes × n_modes)
         residual_cov = self.varx_results.sigma_u
@@ -798,7 +838,7 @@ class MeteorNoiseGenerator:
                 forecast += A_matrices[lag_i] @ y_lag
 
             # Add exogenous contribution: B·x_t (if using exogenous variables)
-            if X_exog is not None:
+            if B_matrix is not None and X_exog is not None:
                 forecast += B_matrix @ X_exog[t]
 
             # Add pre-generated random shock (no MVN call here!)
@@ -1301,6 +1341,15 @@ class MeteorNoiseGenerator:
         print(f"Model loaded from {filepath}")
 
 
+# ---------------------------------------------------------------------------
+# Backward-compatible class alias
+# ---------------------------------------------------------------------------
+# The class definition above is kept as dead code for reference during the
+# transition period.  This alias overwrites the name so that all callers
+# receive the modular PCAVARXNoiseModel implementation instead.
+MeteorNoiseGenerator = PCAVARXNoiseModel
+
+
 def train_noise_model_from_cmip6(
     data_getter,
     experiments,
@@ -1316,6 +1365,7 @@ def train_noise_model_from_cmip6(
     noise_pc_distribution="normal",
     t_df=None,
     verbose=False,
+    model_type="pca-varx",
 ):
     """
     Train a noise generator from CMIP6 data.
@@ -1387,51 +1437,64 @@ def train_noise_model_from_cmip6(
     >>> # Generate realizations
     >>> realizations = noise_model.generate_realization(temp_trajectory)
     """
-    # Get monthly training data
+
+    # Look up the requested model class via the registry
+    cls = get_noise_model_class(model_type)
+    required = cls.required_data()
+
+    # Always fetch monthly training data
     monthly_data = data_getter.make_meteor_training_data_composite(
         experiments, model_name, monthly=True
     )
 
-    # Get piControl baseline if requested
+    # Get piControl baseline if required
     picontrol_baseline = None
-    if use_picontrol_baseline:
+    if use_picontrol_baseline and "picontrol_baseline" in required:
         try:
-            # Try to fetch piControl data for baseline calculation
             picontrol_data = data_getter.get_single_var_mod_data_yearmean(
                 "piControl", variable_name, model_name
             )
             picontrol_baseline = float(picontrol_data.mean().values)
             print(
-                f"   Fetched piControl baseline for {model_name} {variable_name}: {picontrol_baseline:.3f}"
+                f"   Fetched piControl baseline for {model_name} {variable_name}: "
+                f"{picontrol_baseline:.3f}"
             )
         except (KeyError, AttributeError) as e:
             print(
                 f"   Warning: Could not fetch piControl data ({e}), falling back to legacy baseline"
             )
-            picontrol_baseline = None
 
-    # Create and fit noise generator
-    noise_gen = MeteorNoiseGenerator(
+    # Assemble training bundle
+    bundle = TrainingBundle(
+        monthly_data=monthly_data,
+        variable_name=variable_name,
+        custom_global_temp=custom_global_temp,
+        picontrol_baseline=picontrol_baseline,
+    )
+
+    # Build constructor kwargs — only pass params accepted by the model.
+    # PCA-VARX accepts all of these; future models may accept a subset.
+    candidate_kwargs = dict(
         n_modes=n_modes,
         lag_order=lag_order,
         use_exog=use_exog,
         noise_pc_distribution=noise_pc_distribution,
         t_df=t_df,
     )
-    noise_gen.fit(
-        monthly_data,
-        variable_name,
-        custom_global_temp=custom_global_temp,
-        picontrol_baseline=picontrol_baseline,
-        save_diagnostics=save_diagnostics,
-        verbose=verbose,
-    )
+    accepted = set(inspect.signature(cls.__init__).parameters) - {"self"}
+    init_kwargs = {k: v for k, v in candidate_kwargs.items() if k in accepted}
+
+    noise_gen = cls(**init_kwargs)
+    noise_gen.fit(bundle, save_diagnostics=save_diagnostics, verbose=verbose)
+
     # Cache if requested
     if cache_dir is not None:
         os.makedirs(cache_dir, exist_ok=True)
         cache_path = os.path.join(
             cache_dir,
-            _noise_model_cache_name(model_name, variable_name, noise_pc_distribution),
+            _noise_model_cache_name(
+                model_name, variable_name, noise_pc_distribution, model_type
+            ),
         )
         noise_gen.save_model(cache_path)
 
@@ -1449,6 +1512,7 @@ def train_multiple_noise_models_from_cmip6(
     custom_global_temp=None,
     use_picontrol_baseline=True,
     use_exog="temp_only",
+    model_type="pca-varx",
 ):
     """
     Train noise generators for multiple model/variable combinations.
@@ -1531,6 +1595,7 @@ def train_multiple_noise_models_from_cmip6(
                     custom_global_temp=custom_global_temp,
                     use_picontrol_baseline=use_picontrol_baseline,
                     use_exog=use_exog,
+                    model_type=model_type,
                 )
                 noise_models[model][variable] = noise_gen
             except Exception as e:  # pylint: disable=broad-exception-caught
@@ -1541,7 +1606,11 @@ def train_multiple_noise_models_from_cmip6(
 
 
 def load_noise_model_from_cache(
-    cache_dir, model_name, variable_name, noise_pc_distribution="normal"
+    cache_dir,
+    model_name,
+    variable_name,
+    noise_pc_distribution="normal",
+    model_type="pca-varx",
 ):
     """
     Load a previously cached noise model.
@@ -1571,13 +1640,14 @@ def load_noise_model_from_cache(
     """
     cache_path = os.path.join(
         cache_dir,
-        _noise_model_cache_name(model_name, variable_name, noise_pc_distribution),
+        _noise_model_cache_name(model_name, variable_name, noise_pc_distribution, model_type),
     )
 
     if not os.path.exists(cache_path):
         raise FileNotFoundError(f"No cached model found at {cache_path}")
 
-    noise_gen = MeteorNoiseGenerator()
+    cls = get_noise_model_class(model_type)
+    noise_gen = cls()
     noise_gen.load_model(cache_path)
     return noise_gen
 
