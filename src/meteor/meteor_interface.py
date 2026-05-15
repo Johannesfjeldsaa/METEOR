@@ -43,6 +43,7 @@ def _get_default_config(variable):
         "training_scenario": "ssp245",
         "noise_pc_distribution": "normal",
         "t_df": None,
+        "noise_model_type": "pca-varx",
     }
 
     # Variable-specific defaults
@@ -374,6 +375,7 @@ class MeteorInterface:
             Print training progress messages
         """
         noise_pc_distribution = config.get("noise_pc_distribution", "normal")
+        noise_model_type = config.get("noise_model_type", "pca-varx")
         cache_file = self.cache_handler.get_noise_model_cache_path(
             self.model, variable, noise_pc_distribution=noise_pc_distribution
         )
@@ -501,6 +503,7 @@ class MeteorInterface:
                 custom_global_temp=monthly_warming_trimmed,  # ✅ Pass pattern prediction
                 cache_dir=os.path.join(self.cache_handler.cache_dir, "noise_models"),
                 verbose=verbose,
+                model_type=noise_model_type,
             )
 
     def _fit_transform(self, variable, transform_config):
