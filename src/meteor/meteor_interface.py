@@ -199,7 +199,7 @@ class MeteorInterface:
         self._training_config = {}
         self._is_trained = {var: False for var in self.variables}
 
-    def train(self, training_scenario="ssp245", variable_configs=None, verbose=True):
+    def train(self, training_scenario="ssp245", variable_configs=None, verbose=True, force_retrain=False):
         """
         Train pattern scaling and noise models for all variables.
 
@@ -222,6 +222,10 @@ class MeteorInterface:
             - t_df : float, str ('mle'), or None (Student-t degrees of freedom)
         verbose : bool, optional
             Print progress messages (default True)
+        force_retrain : bool or str, default False
+            If True, ignore cached model and retrain from scratch.
+            If 'core' or 'noise', only retrain specific components as needed.
+            Use with caution as this can be time-consuming.
 
         Examples
         --------
@@ -245,6 +249,9 @@ class MeteorInterface:
             print(f"Training METEOR emulator for {self.model}")
             print(f"Variables: {', '.join(self.variables)}")
             print("=" * 60)
+
+        force_retrain_core = force_retrain in [True, "core"]
+        force_retrain_noise = force_retrain in [True, "noise"]
 
         if "tas" not in self.variables:
             if verbose:  # pragma: no cover
@@ -270,12 +277,12 @@ class MeteorInterface:
             # Train pattern scaling
             if verbose:  # pragma: no cover
                 print("   → Training pattern scaling model...")
-            self._train_pattern_scaling(variable, config, verbose=verbose)
+            self._train_pattern_scaling(variable, config, verbose=verbose, force_retrain=force_retrain_core)
 
             # Train noise model
             if verbose:  # pragma: no cover
                 print("   → Training noise model...")
-            self._train_noise_model(variable, config, verbose=verbose)
+            self._train_noise_model(variable, config, verbose=verbose, force_retrain=force_retrain_noise)
 
             # Fit transforms if needed
             transform_config = get_variable_transform_config(variable)
@@ -297,7 +304,7 @@ class MeteorInterface:
             print("✅ All variables trained successfully")
             print("=" * 60)
 
-    def _train_pattern_scaling(self, variable, config, verbose=True):
+    def _train_pattern_scaling(self, variable, config, verbose=True, force_retrain=False):
         """
         Train pattern scaling model for a variable.
 
@@ -312,6 +319,9 @@ class MeteorInterface:
             Configuration with 'n_modes_pattern' specifying number of patterns
         verbose : bool
             Print training progress messages
+        force_retrain : bool, default False
+            If True, ignore cached model and retrain from scratch.
+            Use with caution as this can be time-consuming.
         """
         cache_file = self.cache_handler.get_pattern_scaling_cache_path(
             self.model, variable=variable
@@ -321,6 +331,11 @@ class MeteorInterface:
         is_valid, cached_model, info = (  # pylint: disable=unused-variable
             self.data_getter.validate_pattern_scaling_cache(cache_file, self.model)
         )
+
+        if force_retrain:
+            if verbose:
+                print("      ⚠️  Force retrain enabled, ignoring cache")
+            is_valid = False
 
         if is_valid:
             if verbose:  # pragma: no cover
@@ -349,7 +364,7 @@ class MeteorInterface:
             cache_dir=os.path.join(self.cache_handler.cache_dir, "pattern_scaling"),
         )
 
-    def _train_noise_model(self, variable, config, verbose=True):
+    def _train_noise_model(self, variable, config, verbose=True, force_retrain=False):
         """
         Train monthly noise model for a variable.
 
@@ -373,6 +388,9 @@ class MeteorInterface:
             - 't_df': Student-t degrees of freedom (float, list, or None)
         verbose : bool
             Print training progress messages
+        force_retrain : bool, default False
+            If True, ignore cached model and retrain from scratch.
+            Use with caution as this can be time-consuming.
         """
         noise_pc_distribution = config.get("noise_pc_distribution", "normal")
         noise_model_type = config.get("noise_model_type", "pca-varx")
@@ -391,6 +409,11 @@ class MeteorInterface:
                 t_df=config.get("t_df", None),
             )
         )
+
+        if force_retrain:
+            if verbose:  # pragma: no   cover
+                print("      ⚠️  Force retrain enabled, ignoring cache")
+            is_valid = False
 
         if is_valid:
             if verbose:  # pragma: no cover
@@ -492,7 +515,7 @@ class MeteorInterface:
             # Train noise model using data getter interface
             self.noise_models[variable] = train_noise_model_from_cmip6(
                 self.data_getter,
-                experiments=["historical", training_scenario],  # ✅ Use config scenario
+                experiments=["historical", training_scenario],
                 model_name=self.model,
                 variable_name=variable,
                 n_modes=config["n_modes_noise"],
@@ -500,7 +523,7 @@ class MeteorInterface:
                 use_exog=config["use_exog"],
                 noise_pc_distribution=noise_pc_distribution,
                 t_df=config.get("t_df", None),
-                custom_global_temp=monthly_warming_trimmed,  # ✅ Pass pattern prediction
+                custom_global_temp=monthly_warming_trimmed,
                 cache_dir=os.path.join(self.cache_handler.cache_dir, "noise_models"),
                 verbose=verbose,
                 model_type=noise_model_type,

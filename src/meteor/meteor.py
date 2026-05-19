@@ -90,7 +90,11 @@ class Meteor:
         new_realisation = mean_warming_pattern + new_noise
 
         # add the new realisation to the ensemble
-        self.ensemble_ = xr.concat([self.ensemble_, new_realisation], dim="member")
+        self.ensemble_ = xr.concat(
+            [self.ensemble_, new_realisation],
+            dim="member",
+            join="outer",
+        )
 
 
 def read_training_data(get_training_data, exp_list, from_file=True):
@@ -120,7 +124,7 @@ def read_training_data(get_training_data, exp_list, from_file=True):
         if not i:
             dac = tmp
         else:
-            dac = xr.concat([dac, tmp], "expt")
+            dac = xr.concat([dac, tmp], "expt", join='outer')
     dac = dac.assign_coords({"expt": exp_list})
     ctrl = exp_list.index("base")
     varis = dac.data_vars
@@ -590,7 +594,9 @@ class MeteorPatternScaling:
                     )
                     tmp["time"] = pd.to_datetime(tmp["time"], format="%Y")
                     if return_patterns_per_mode:
-                        predicted[fld] = xr.concat((predicted[fld], tmp), dim="mode")
+                        predicted[fld] = xr.concat(
+                            (predicted[fld], tmp), dim="mode", join="outer"
+                        )
                     else:
                         predicted[fld] = predicted[fld] + tmp
         return predicted
