@@ -20,6 +20,12 @@ from .noise_generator import (  # noqa: F401
     MeteorNoiseGenerator,
     train_noise_model_from_cmip6,
 )
+from .noise_model import (  # noqa: F401
+    NoiseModelBase,
+    PCAVARXNoiseModel,
+    SeasonalModel,
+    get_noise_model_class,
+)
 from .precipitation_transform import (  # noqa: F401
     apply_distribution_transform,
     apply_empirical_quantile_mapping,
